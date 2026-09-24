@@ -13,8 +13,8 @@ router.use(requireAuth);
 // ---------- List products (with search/filter/pagination) ----------
 router.get('/', async (req, res, next) => {
   try {
-    const { search = '', category = 'All', status = 'All', page = 1, pageSize = 50 } = req.query;
-    const conditions = ['active = true'];
+    const { search = '', category = 'All', status = 'All', page = 1, pageSize = 50, includeInactive } = req.query;
+    const conditions = includeInactive === 'true' ? [] : ['active = true'];
     const params = [];
 
     if (search) {
@@ -218,6 +218,32 @@ router.post('/:id/adjust', requireRole('Admin', 'Manager', 'Inventory'), validat
     if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     next(err);
   }
+});
+
+// ---------- Deactivate / reactivate a product (owner-only, manual) ----------
+// Soft-delete pattern: keeps historical sales/purchases/returns intact (they reference
+// products by id via foreign keys) while letting the business owner hide demo/retired
+// products from day-to-day screens. Deliberately NOT tied to the Admin role — several
+// people can be Admin, but only the actual business owner should be able to do this.
+router.put('/:id/status', async (req, res, next) => {
+  try {
+    if (!req.user.isOwner) {
+      return res.status(403).json({ error: 'Only the business owner can deactivate or reactivate products.' });
+    }
+    const { active } = req.body;
+    if (typeof active !== 'boolean') return res.status(400).json({ error: 'active (boolean) is required.' });
+
+    const { rows } = await pool.query(
+      'UPDATE products SET active = $1, updated_at = now() WHERE id = $2 RETURNING *',
+      [active, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Product not found.' });
+
+    await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
+      action: `${active ? 'Reactivated' : 'Deactivated'} product ${rows[0].name}`, module: 'Products & Inventory' });
+
+    res.json({ product: rows[0] });
+  } catch (err) { next(err); }
 });
 
 module.exports = router;
