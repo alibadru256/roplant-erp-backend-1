@@ -18,7 +18,7 @@ router.get('/', async (req, res, next) => {
     const { rows } = await pool.query(
       `SELECT po.*, s.name AS supplier_name,
          COALESCE(json_agg(json_build_object(
-           'productId', pi.product_id, 'qtyOrdered', pi.qty_ordered, 'qtyReceived', pi.qty_received, 'unitCost', pi.unit_cost
+           'id', pi.id, 'productId', pi.product_id, 'qtyOrdered', pi.qty_ordered, 'qtyReceived', pi.qty_received, 'unitCost', pi.unit_cost
          )) FILTER (WHERE pi.id IS NOT NULL), '[]') AS items
        FROM purchase_orders po
        JOIN suppliers s ON s.id = po.supplier_id
