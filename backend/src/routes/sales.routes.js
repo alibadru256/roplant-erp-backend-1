@@ -165,6 +165,69 @@ function httpError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
 }
 
+/**
+ * Corrects a sale recorded with the wrong payment status (e.g. rung up as Cash when it was
+ * actually on credit, or vice versa). This is NOT a re-sale — stock already moved and is left
+ * alone. It only reclassifies the accounting side: the revenue, tax, and COGS lines posted at
+ * sale time are correct regardless of who ends up paying, so only the cash/receivable side of
+ * the ledger and the customer's balance are touched, mirroring the exact account codes used
+ * when the sale was first created (see POST / above).
+ */
+router.put('/:id/status', requireRole('Admin', 'Manager'), async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    if (!['Paid', 'Credit'].includes(status)) {
+      return res.status(400).json({ error: 'Status correction only supports switching between Paid and Credit.' });
+    }
+
+    const result = await withTransaction(async (client) => {
+      const { rows: saleRows } = await client.query('SELECT * FROM sales WHERE id = $1 FOR UPDATE', [req.params.id]);
+      const sale = saleRows[0];
+      if (!sale) throw httpError(404, 'Sale not found.');
+      if (sale.status === status) throw httpError(400, `This sale is already marked ${status}.`);
+      if (!['Paid', 'Credit'].includes(sale.status)) {
+        throw httpError(409, `Cannot correct a sale currently marked "${sale.status}" — only Paid ↔ Credit corrections are supported.`);
+      }
+
+      const { rows: custRows } = await client.query('SELECT * FROM customers WHERE id = $1 FOR UPDATE', [sale.customer_id]);
+      const customer = custRows[0];
+
+      // Same mapping used at sale creation — Card and Cash/Mobile Money post to different
+      // cash accounts, so the reversal has to target the same one the original entry used.
+      const cashAccount = sale.payment_method === 'Card' ? '1010' : '1000';
+      const total = Number(sale.total);
+
+      if (status === 'Credit') {
+        await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [total, customer.id]);
+        await postJournalEntry(client, {
+          memo: `Correction: ${sale.invoice_no} reclassified Paid → Credit`,
+          sourceModule: 'POS', sourceReference: sale.invoice_no, userId: req.user.id,
+          lines: [{ accountCode: '1100', debit: total }, { accountCode: cashAccount, credit: total }],
+        });
+      } else {
+        await client.query('UPDATE customers SET balance = GREATEST(0, balance - $1) WHERE id = $2', [total, customer.id]);
+        await postJournalEntry(client, {
+          memo: `Correction: ${sale.invoice_no} reclassified Credit → Paid`,
+          sourceModule: 'POS', sourceReference: sale.invoice_no, userId: req.user.id,
+          lines: [{ accountCode: cashAccount, debit: total }, { accountCode: '1100', credit: total }],
+        });
+      }
+
+      const { rows: updated } = await client.query('UPDATE sales SET status = $1 WHERE id = $2 RETURNING *', [status, sale.id]);
+      await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
+        action: `Corrected ${sale.invoice_no} status: ${sale.status} → ${status}`, module: 'Customers',
+        before: sale.status, after: status }, client);
+
+      return { ...updated[0], customerName: customer.name };
+    });
+
+    res.json({ sale: result });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    next(err);
+  }
+});
+
 // ---- Real, downloadable PDF for any invoice (not the browser's print-to-PDF) ----
 router.get('/:id/pdf', async (req, res, next) => {
   try {
