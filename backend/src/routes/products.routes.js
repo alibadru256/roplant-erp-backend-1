@@ -89,7 +89,7 @@ router.post('/', requireRole('Admin', 'Manager', 'Inventory'), validateBody(prod
       return res.status(400).json({ error: 'sku, name, category, costPrice and sellPrice are required.' });
     }
     if (p.costPrice < 0 || p.sellPrice < 0) return res.status(400).json({ error: 'Prices cannot be negative.' });
-    if (typeof p.image === 'string' && p.image.startsWith('data:') && p.image.length > 500_000) {
+    if (typeof p.image === 'string' && p.image.startsWith('data:') && p.image.length > 6_000_000) {
       return res.status(413).json({ error: 'Uploaded image is too large. Use an image URL instead, or a smaller file (production should use real object storage, not base64 in the database).' });
     }
 
@@ -148,7 +148,7 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
       });
     }
 
-    if (typeof p.image === 'string' && p.image.startsWith('data:') && p.image.length > 500_000) {
+    if (typeof p.image === 'string' && p.image.startsWith('data:') && p.image.length > 6_000_000) {
       return res.status(413).json({ error: 'Uploaded image is too large. Use an image URL instead, or a smaller file (production should use real object storage, not base64 in the database).' });
     }
 
