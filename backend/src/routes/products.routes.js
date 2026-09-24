@@ -45,6 +45,29 @@ router.get('/', async (req, res, next) => {
 });
 
 // ---------- Get one product with full history ----------
+// General stock movement feed across all products — the per-product route below only covers
+// a single product's history; this is what an "adjustment history" or "recent activity"
+// screen actually needs. Must be registered BEFORE GET /:id, or Express would match this
+// path as if "movements" were a product id and this route would never be reached.
+router.get('/movements/all', async (req, res, next) => {
+  try {
+    const { limit, offset, page, pageSize } = parsePagination(req.query);
+    const { type } = req.query;
+    const typeClause = type ? 'WHERE sm.type = $3' : '';
+    const params = type ? [limit, offset, type] : [limit, offset];
+    const { rows } = await pool.query(
+      `SELECT sm.*, p.name AS product_name, p.sku AS product_sku, u.name AS user_name
+       FROM stock_movements sm
+       JOIN products p ON p.id = sm.product_id
+       LEFT JOIN users u ON u.id = sm.user_id
+       ${typeClause}
+       ORDER BY sm.created_at DESC LIMIT $1 OFFSET $2`,
+      params
+    );
+    res.json({ movements: rows, page, pageSize });
+  } catch (err) { next(err); }
+});
+
 router.get('/:id', async (req, res, next) => {
   try {
     const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
