@@ -18,8 +18,8 @@ router.put('/', requireRole('Admin'), async (req, res, next) => {
     const { companyName, address, phone, phone2, email, currency, taxRate, invoicePrefix, receiptFooter,
             tagline, shopLocation, poBox, cityCountry, logo } = req.body;
 
-    if (typeof logo === 'string' && logo.startsWith('data:') && logo.length > 500_000) {
-      return res.status(413).json({ error: 'Uploaded logo is too large. Use a smaller image file.' });
+    if (typeof logo === 'string' && logo.startsWith('data:') && logo.length > 6_000_000) {
+      return res.status(413).json({ error: 'Uploaded logo is too large (max ~4-5MB). Try a smaller image or compress it first.' });
     }
 
     const { rows } = await pool.query(
