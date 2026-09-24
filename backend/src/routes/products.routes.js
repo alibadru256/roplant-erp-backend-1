@@ -6,6 +6,7 @@ const { nextDocumentNumber } = require('../utils/documentNumbering');
 const { applyStockAdjustment } = require('../utils/calculations');
 const { broadcast } = require('../utils/events');
 const { validateBody, productCreateSchema, productAdjustSchema } = require('../utils/schemas');
+const { parsePagination } = require('../utils/pagination');
 
 const router = express.Router();
 router.use(requireAuth);
