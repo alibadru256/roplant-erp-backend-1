@@ -42,7 +42,10 @@ router.post('/', requireRole('Admin', 'Manager'), async (req, res, next) => {
       return rows[0];
     });
     res.status(201).json({ supplier: result });
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A supplier with conflicting unique details already exists.' });
+    next(err);
+  }
 });
 
 // Edit — also did not exist. Same optimistic-concurrency pattern as products/customers.
