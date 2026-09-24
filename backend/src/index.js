@@ -39,7 +39,7 @@ if (!isProduction && corsOrigins === '*') {
 }
 app.use(cors({ origin: corsOrigins }));
 
-app.use(express.json({ limit: '2mb' })); // 2mb covers base64 product image uploads (also capped per-field, see products.routes.js)
+app.use(express.json({ limit: '8mb' })); // covers base64 logo/product image uploads (also capped per-field — see settings.routes.js and products.routes.js)
 
 // Lightweight structured request log — every request, one JSON line, no request body
 // (avoids ever accidentally logging a password).
