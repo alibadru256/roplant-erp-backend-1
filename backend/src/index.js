@@ -24,6 +24,8 @@ const barcodeRoutes = require('./routes/barcode.routes');
 const notificationsRoutes = require('./routes/notifications.routes');
 const eventsRoutes = require('./routes/events.routes');
 const categoriesRoutes = require('./routes/categories.routes');
+const backupRoutes = require('./routes/backup.routes');
+const { startBackupScheduler } = require('./utils/backup');
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
@@ -83,6 +85,7 @@ app.use('/api/barcode', barcodeRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/categories', categoriesRoutes);
+app.use('/api/backups', backupRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 app.use(errorHandler);
@@ -91,6 +94,10 @@ const PORT = process.env.PORT || 4000;
 const server = app.listen(PORT, () => {
   logger.info('Roplant ERP API started', { port: PORT, env: process.env.NODE_ENV || 'development' });
 });
+
+// Daily database backup — checks hourly, self-healing if a check is missed (e.g. a redeploy
+// happened right at the scheduled moment). See src/utils/backup.js for what's included.
+startBackupScheduler();
 
 // ---- Resilience: a single unhandled error must never silently corrupt state or hang forever.
 // Log it clearly, then exit — a process manager (PM2, Railway, Render, systemd) restarts us
