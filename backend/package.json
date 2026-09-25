@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
-    "migrate": "for f in db/migrations/001_init.sql db/migrations/003_accounting_and_extras.sql db/migrations/004_schema_audit_fixes.sql db/migrations/005_owner_flag.sql db/migrations/006_settings_letterhead_fields.sql db/migrations/007_settings_logo.sql; do echo \"Running $f...\"; psql \"$DATABASE_URL\" -f $f || exit 1; done",
+    "migrate": "for f in db/migrations/001_init.sql db/migrations/003_accounting_and_extras.sql db/migrations/004_schema_audit_fixes.sql db/migrations/005_owner_flag.sql db/migrations/006_settings_letterhead_fields.sql db/migrations/007_settings_logo.sql db/migrations/008_backups.sql; do echo \"Running $f...\"; psql \"$DATABASE_URL\" -f $f || exit 1; done",
     "seed": "psql \"$DATABASE_URL\" -f db/migrations/002_seed.sql",
     "hash": "node scripts/hash-password.js",
     "test": "node --test test/*.test.js",
