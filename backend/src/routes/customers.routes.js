@@ -67,13 +67,15 @@ router.put('/:id', requireRole('Admin', 'Manager'), async (req, res, next) => {
       return res.status(409).json({ error: 'This customer was changed by someone else since you loaded it. Reload and try again.', current: existing });
     }
 
-    // ::timestamptz(3) truncation on both sides — see the identical comment in products.routes.js
-    // PUT /:id. Without it, this WHERE clause almost never matched (the column keeps microsecond
-    // precision from now(), a JS Date/JSON round trip only keeps milliseconds), which was the
-    // real cause of "already edited, try again" firing on ordinary, uncontested edits.
+    // date_trunc('milliseconds', ...) on both sides — see the identical comment in
+    // products.routes.js PUT /:id. Without it, this WHERE clause almost never matched (the
+    // column keeps microsecond precision from now(), a JS Date/JSON round trip only keeps
+    // milliseconds, truncated not rounded), which was the real cause of "already edited, try
+    // again" firing on ordinary, uncontested edits. Must be date_trunc, not a ::timestamptz(3)
+    // cast — that rounds instead of truncating and can still mismatch.
     const { rows } = await pool.query(
       `UPDATE customers SET name=$1, phone=$2, email=$3, address=$4, credit_limit=$5, updated_at=now()
-       WHERE id=$6 AND updated_at::timestamptz(3) = $7::timestamptz(3) RETURNING *`,
+       WHERE id=$6 AND date_trunc('milliseconds', updated_at) = date_trunc('milliseconds', $7::timestamptz) RETURNING *`,
       [name ?? existing.name, phone ?? existing.phone, email ?? existing.email, address ?? existing.address,
        creditLimit ?? existing.credit_limit, req.params.id, existing.updated_at]
     );
