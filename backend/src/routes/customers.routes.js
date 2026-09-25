@@ -31,14 +31,16 @@ router.get('/', async (req, res, next) => {
 router.post('/', requireRole('Admin', 'Manager', 'Sales'), async (req, res, next) => {
   try {
     const { name, phone, email, address, creditLimit = 0, openingBalance = 0 } = req.body;
-    if (!name || !phone) return res.status(400).json({ error: 'Name and phone are required.' });
+    // Only the name is truly required — a walk-in customer is often added on the spot at the
+    // till with just a name, and phone/email can be filled in later if ever.
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required.' });
 
     const result = await withTransaction(async (client) => {
       const customerCode = await nextDocumentNumber(client, 'customer_code', { prefix: 'CUST', padTo: 4 });
       const { rows } = await client.query(
         `INSERT INTO customers (customer_code, name, phone, email, address, credit_limit, opening_balance, balance)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING *`,
-        [customerCode, name, phone, email || null, address || null, creditLimit, openingBalance]
+        [customerCode, name.trim(), phone || null, email || null, address || null, creditLimit, openingBalance]
       );
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
         action: `Added customer ${name} (${customerCode})`, module: 'Customers' }, client);
@@ -65,13 +67,21 @@ router.put('/:id', requireRole('Admin', 'Manager'), async (req, res, next) => {
       return res.status(409).json({ error: 'This customer was changed by someone else since you loaded it. Reload and try again.', current: existing });
     }
 
+    // ::timestamptz(3) truncation on both sides — see the identical comment in products.routes.js
+    // PUT /:id. Without it, this WHERE clause almost never matched (the column keeps microsecond
+    // precision from now(), a JS Date/JSON round trip only keeps milliseconds), which was the
+    // real cause of "already edited, try again" firing on ordinary, uncontested edits.
     const { rows } = await pool.query(
       `UPDATE customers SET name=$1, phone=$2, email=$3, address=$4, credit_limit=$5, updated_at=now()
-       WHERE id=$6 AND updated_at=$7 RETURNING *`,
+       WHERE id=$6 AND updated_at::timestamptz(3) = $7::timestamptz(3) RETURNING *`,
       [name ?? existing.name, phone ?? existing.phone, email ?? existing.email, address ?? existing.address,
        creditLimit ?? existing.credit_limit, req.params.id, existing.updated_at]
     );
-    if (!rows[0]) return res.status(409).json({ error: 'This customer was changed by someone else a moment ago. Reload and try again.' });
+    if (!rows[0]) {
+      // As with products: refetch so the frontend's auto-retry has a `current` row to retry against.
+      const { rows: freshRows } = await pool.query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
+      return res.status(409).json({ error: 'This customer was changed by someone else a moment ago. Reload and try again.', current: freshRows[0] });
+    }
 
     await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
       action: `Edited customer ${rows[0].name}`, module: 'Customers', before: existing.name, after: rows[0].name });
