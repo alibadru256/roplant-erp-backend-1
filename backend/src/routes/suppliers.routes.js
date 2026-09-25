@@ -60,12 +60,20 @@ router.put('/:id', requireRole('Admin', 'Manager'), async (req, res, next) => {
       return res.status(409).json({ error: 'This supplier was changed by someone else since you loaded it. Reload and try again.', current: existing });
     }
 
+    // ::timestamptz(3) truncation on both sides — see the identical comment in products.routes.js
+    // PUT /:id. Without it, this WHERE clause almost never matched (the column keeps microsecond
+    // precision from now(), a JS Date/JSON round trip only keeps milliseconds), which was the
+    // real cause of "already edited, try again" firing on ordinary, uncontested edits.
     const { rows } = await pool.query(
       `UPDATE suppliers SET name=$1, phone=$2, email=$3, address=$4, updated_at=now()
-       WHERE id=$5 AND updated_at=$6 RETURNING *`,
+       WHERE id=$5 AND updated_at::timestamptz(3) = $6::timestamptz(3) RETURNING *`,
       [name ?? existing.name, phone ?? existing.phone, email ?? existing.email, address ?? existing.address, req.params.id, existing.updated_at]
     );
-    if (!rows[0]) return res.status(409).json({ error: 'This supplier was changed by someone else a moment ago. Reload and try again.' });
+    if (!rows[0]) {
+      // As with products: refetch so the frontend's auto-retry has a `current` row to retry against.
+      const { rows: freshRows } = await pool.query('SELECT * FROM suppliers WHERE id = $1', [req.params.id]);
+      return res.status(409).json({ error: 'This supplier was changed by someone else a moment ago. Reload and try again.', current: freshRows[0] });
+    }
 
     await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
       action: `Edited supplier ${rows[0].name}`, module: 'Suppliers', before: existing.name, after: rows[0].name });
