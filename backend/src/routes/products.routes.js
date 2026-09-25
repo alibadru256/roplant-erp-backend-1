@@ -156,17 +156,31 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
     const { rows: catRows } = await pool.query('SELECT id FROM categories WHERE name = $1', [p.category]);
     const categoryId = catRows[0]?.id || null;
 
+    // updated_at::timestamptz(3): Postgres' `now()` stores microsecond precision, but a JS Date
+    // (what existing.updated_at becomes once node-postgres reads it, and what any JSON round
+    // trip to the frontend and back preserves) can only hold milliseconds. Comparing the column
+    // to that JS-Date-derived parameter with plain equality was comparing "...573691" (the real
+    // stored value) to "...573000" (what any client can actually send back) — a mismatch on
+    // essentially every single edit, not just genuine conflicts. This was the real cause of the
+    // "already edited, try again" bug reported from day one. Truncating both sides to
+    // millisecond precision before comparing fixes it, while still catching true conflicts
+    // (a change that happened even one millisecond apart still won't match).
     const { rows } = await pool.query(
       `UPDATE products SET name=$1, category=$2, category_id=$3, brand=$4, compatibility=$5, part_number=$6,
          cost_price=$7, sell_price=$8, reorder_level=$9, max_stock=$10, rack=$11, shelf_bin=$12,
          image=$13, primary_supplier_id=$14, updated_at=now()
-       WHERE id=$15 AND updated_at = $16 RETURNING *`,
+       WHERE id=$15 AND updated_at::timestamptz(3) = $16::timestamptz(3) RETURNING *`,
       [p.name, p.category, categoryId, p.brand, p.compatibility, p.partNumber, p.costPrice, p.sellPrice,
        p.reorderLevel, p.maxStock, p.rack, p.shelfBin, p.image, p.primarySupplierId, req.params.id, existing.updated_at]
     );
-    // Extremely rare race: passed the check above but lost the row-level race to another
-    // request between the SELECT and this UPDATE. The WHERE updated_at=$15 guard catches it.
-    if (!rows[0]) return res.status(409).json({ error: 'This product was changed by someone else a moment ago. Reload and try again.' });
+    // Genuine race: passed the check above but lost the row-level race to another request between
+    // the SELECT and this UPDATE — the WHERE guard above catches it. This used to omit `current`,
+    // which meant the frontend's auto-retry (see resolveConflictAndRetry in App.jsx) had nothing
+    // to retry with and just failed outright — refetch the row so it can.
+    if (!rows[0]) {
+      const { rows: freshRows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
+      return res.status(409).json({ error: 'This product was changed by someone else a moment ago. Reload and try again.', current: freshRows[0] });
+    }
 
     await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
       action: `Edited ${rows[0].name}`, module: 'Products & Inventory',
