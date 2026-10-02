@@ -4,6 +4,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
 const { nextDocumentNumber } = require('../utils/documentNumbering');
 const { applyStockAdjustment } = require('../utils/calculations');
+const { postJournalEntry } = require('../utils/accounting');
 const { broadcast } = require('../utils/events');
 const { validateBody, productCreateSchema, productAdjustSchema } = require('../utils/schemas');
 const { parsePagination } = require('../utils/pagination');
@@ -95,7 +96,15 @@ router.post('/', requireRole('Admin', 'Manager', 'Inventory'), validateBody(prod
     }
 
     const result = await withTransaction(async (client) => {
-      const { rows: catRows } = await client.query('SELECT id FROM categories WHERE name = $1', [p.category]);
+      // Auto-create the category if this is the first product using that name — otherwise a
+      // brand-new category typed on the product form would silently have no row in `categories`
+      // at all, and the dashboard's stock-by-category chart, valuation export and category
+      // filters (which read from `categories`, not free-text product.category) would never
+      // show it. `name` is UNIQUE, so this is safe to race against a concurrent create.
+      const { rows: catRows } = await client.query(
+        `INSERT INTO categories (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+        [p.category]
+      );
       const categoryId = catRows[0]?.id || null;
 
       const insert = await client.query(
@@ -153,7 +162,11 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
       return res.status(413).json({ error: 'Uploaded image is too large. Use an image URL instead, or a smaller file (production should use real object storage, not base64 in the database).' });
     }
 
-    const { rows: catRows } = await pool.query('SELECT id FROM categories WHERE name = $1', [p.category]);
+    // Same auto-create as the create route above — see the comment there.
+    const { rows: catRows } = await pool.query(
+      `INSERT INTO categories (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+      [p.category]
+    );
     const categoryId = catRows[0]?.id || null;
 
     // date_trunc('milliseconds', ...): Postgres' `now()` stores microsecond precision, but a JS
@@ -223,6 +236,28 @@ router.post('/:id/adjust', requireRole('Admin', 'Manager', 'Inventory'), validat
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [product.id, type, delta, product.stock_qty, newQty, reason, ref, req.user.id]
       );
+
+      // A "Damage" adjustment permanently removes value from inventory the same way a
+      // non-resellable customer return does (see returns.routes.js) — it must write that value
+      // out of the books, not just off the shelf. Without this, stock_qty and the General
+      // Ledger's Inventory Asset balance (1200) would silently drift apart every time damaged
+      // stock was written off here, and the loss would never appear in any financial report.
+      if (direction === 'Damage') {
+        const writeOffValue = Math.abs(delta) * Number(product.cost_price);
+        if (writeOffValue > 0) {
+          await postJournalEntry(client, {
+            memo: `Damaged stock written off — ${product.name} x${qty} (${reason})`,
+            sourceModule: 'Inventory Control Center',
+            sourceReference: ref,
+            userId: req.user.id,
+            lines: [
+              { accountCode: '5100', debit: writeOffValue },
+              { accountCode: '1200', credit: writeOffValue },
+            ],
+          });
+        }
+      }
+
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
         action: `Stock adjustment on ${product.name}: ${delta > 0 ? '+' : ''}${delta} — ${reason}`,
         module: 'Inventory Control Center', before: `Stock: ${product.stock_qty}`, after: `Stock: ${newQty}` }, client);

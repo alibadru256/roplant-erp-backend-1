@@ -102,6 +102,14 @@ async function pruneBackups() {
       SELECT id FROM backups WHERE kind = 'pre_restore_safety' ORDER BY created_at DESC OFFSET 10
     )
   `);
+  // 'pre_reset_safety' — the automatic snapshot taken right before a production reset (see
+  // reset.routes.js). Capped the same way as pre_restore_safety; a reset is rare enough that
+  // this cap is really just a backstop.
+  await pool.query(`
+    DELETE FROM backups WHERE id IN (
+      SELECT id FROM backups WHERE kind = 'pre_reset_safety' ORDER BY created_at DESC OFFSET 10
+    )
+  `);
 }
 
 /**
