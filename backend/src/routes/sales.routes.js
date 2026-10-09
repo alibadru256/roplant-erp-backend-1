@@ -5,7 +5,8 @@ const { logAudit } = require('../utils/audit');
 const { nextDocumentNumber } = require('../utils/documentNumbering');
 const { getSettings } = require('../utils/settings');
 const { postJournalEntry } = require('../utils/accounting');
-const { computeSaleTotals, exceedsCreditLimit, deductStock } = require('../utils/calculations');
+const { computeSaleTotals, exceedsCreditLimit } = require('../utils/calculations');
+const { lockProducts, getAllLocationQty, applyStockChange, SELLABLE_LOCATION } = require('../utils/stockLocations');
 const { parsePagination } = require('../utils/pagination');
 const { broadcast } = require('../utils/events');
 const { notifyLowStock } = require('../utils/email');
@@ -40,7 +41,7 @@ router.get('/', async (req, res, next) => {
 // ---------- Complete a sale — the single most important transaction in the app ----------
 router.post('/', requireRole('Admin', 'Manager', 'Sales'), validateBody(saleSchema), async (req, res, next) => {
   try {
-    const { customerId, items, discountPct = 0, paymentMethod } = req.body;
+    const { customerId, items, discountPct = 0, discountAmount = 0, paymentMethod } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Cart is empty.' });
     if (!['Cash', 'Card', 'Mobile Money', 'Credit'].includes(paymentMethod)) {
@@ -63,19 +64,35 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales'), validateBody(saleSche
 
       // Lock every product row involved BEFORE computing totals, so two simultaneous sales
       // of the same item can never both succeed against stock that only covers one of them.
+      //
+      // THE POS SELLS FROM THE SHOP ONLY. Warehouse stock, unallocated legacy stock and goods in
+      // transit are all invisible to a sale: availability below is the SHOP balance alone, and the
+      // deduction further down is taken from the shop alone. Because this is enforced here on the
+      // server, a cashier cannot bypass it through the UI, a hand-crafted API call, or any other
+      // route — there is no other route that creates a sale.
+      const lockedProducts = await lockProducts(client, items.map((i) => i.productId)); // ascending id order: no deadlocks
+      const requestedPerProduct = new Map();
       for (const item of items) {
-        const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [item.productId]);
-        const product = prodRows[0];
-        if (!product) throw httpError(404, `Product ${item.productId} not found.`);
-        if (product.stock_qty < item.qty) {
-          throw httpError(409, `Not enough stock for "${product.name}" — only ${product.stock_qty} available.`);
+        requestedPerProduct.set(item.productId, (requestedPerProduct.get(item.productId) || 0) + item.qty);
+      }
+      for (const [productId, requested] of requestedPerProduct) {
+        const product = lockedProducts.get(productId);
+        if (!product) throw httpError(404, `Product ${productId} not found.`);
+        const where = await getAllLocationQty(client, productId);
+        if (where[SELLABLE_LOCATION] < requested) {
+          throw httpError(409, where[SELLABLE_LOCATION] === 0
+            ? `Out of stock at shop for "${product.name}".${where.warehouse > 0 ? ` Available in warehouse: ${where.warehouse} units. Transfer required.` : ''}`
+            : `Not enough stock at the shop for "${product.name}" — only ${where[SELLABLE_LOCATION]} available at the shop (${requested} requested).${where.warehouse > 0 ? ` Available in warehouse: ${where.warehouse} units. Transfer required.` : ''}`);
         }
+      }
+      for (const item of items) {
+        const product = lockedProducts.get(item.productId);
         subtotal += Number(product.sell_price) * item.qty;
         lineDetails.push({ product, qty: item.qty });
       }
 
       const settings = await getSettings(client);
-      const { discountAmt, tax, total } = computeSaleTotals(subtotal, discountPct, Number(settings.tax_rate));
+      const { discountAmt, tax, total } = computeSaleTotals(subtotal, discountPct, Number(settings.tax_rate), discountAmount);
 
       if (paymentMethod === 'Credit' && exceedsCreditLimit(Number(customer.balance), total, Number(customer.credit_limit))) {
         throw httpError(409, `This sale would exceed ${customer.name}'s credit limit.`);
@@ -97,18 +114,12 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales'), validateBody(saleSche
            VALUES ($1,$2,$3,$4,$5,$6,$7)`,
           [sale.id, product.id, product.sku, product.name, qty, product.sell_price, product.cost_price]
         );
-        let newQty;
-        try {
-          newQty = deductStock(product.stock_qty, qty);
-        } catch (calcErr) {
-          throw httpError(409, calcErr.message);
-        }
-        await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [newQty, product.id]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, unit_cost, reference, user_id)
-           VALUES ($1, 'Sale', $2, $3, $4, $5, $6, $7)`,
-          [product.id, -qty, product.stock_qty, newQty, product.cost_price, invoiceNo, req.user.id]
-        );
+        // Deducts from the SHOP balance only (throws 409 if it would go negative) and writes the
+        // 'Sale' ledger row tagged location='shop'. Warehouse stock is never touched by a sale.
+        await applyStockChange(client, {
+          productId: product.id, location: SELLABLE_LOCATION, delta: -qty, type: 'Sale',
+          unitCost: product.cost_price, reference: invoiceNo, userId: req.user.id,
+        });
       }
 
       if (paymentMethod === 'Credit') {

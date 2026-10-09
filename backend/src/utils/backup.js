@@ -21,8 +21,11 @@ const TABLES = [
   { name: 'customers', pk: 'id', hasSequence: true },
   { name: 'categories', pk: 'id', hasSequence: true },
   { name: 'products', pk: 'id', hasSequence: true, excludeColumns: ['image'] },
+  { name: 'product_stock', pk: 'product_id', hasSequence: false }, // per-location balances (warehouse / shop / unallocated)
   { name: 'accounts', pk: 'code', hasSequence: false },
   { name: 'stock_movements', pk: 'id', hasSequence: true },
+  { name: 'stock_transfers', pk: 'id', hasSequence: true },
+  { name: 'stock_transfer_items', pk: 'id', hasSequence: true },
   { name: 'sales', pk: 'id', hasSequence: true },
   { name: 'sale_items', pk: 'id', hasSequence: true },
   { name: 'purchase_orders', pk: 'id', hasSequence: true },
@@ -170,6 +173,17 @@ async function restoreSnapshot(snapshotData) {
           );
         }
       }
+    }
+
+    // A backup taken BEFORE warehouse/shop locations existed has no product_stock rows. Restoring
+    // it would otherwise leave products with a stock_qty but no location balances. Park that stock
+    // in 'unallocated' (exactly as migration 010 did) so totals still reconcile and nothing is
+    // guessed into the warehouse or the shop.
+    if (!snapshotData.product_stock) {
+      await client.query(
+        `INSERT INTO product_stock (product_id, location, qty)
+         SELECT id, 'unallocated', stock_qty FROM products WHERE stock_qty > 0`
+      );
     }
   });
 }

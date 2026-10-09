@@ -3,7 +3,7 @@ const { pool, withTransaction } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
 const { nextDocumentNumber } = require('../utils/documentNumbering');
-const { applyStockAdjustment } = require('../utils/calculations');
+const { applyStockChange } = require('../utils/stockLocations');
 const { postJournalEntry } = require('../utils/accounting');
 const { broadcast } = require('../utils/events');
 const { validateBody, productCreateSchema, productAdjustSchema } = require('../utils/schemas');
@@ -36,8 +36,31 @@ router.get('/', async (req, res, next) => {
     const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
     params.push(limit, offset);
+    // Same product rows as ever (stock_qty = total on hand across locations), plus the per-location
+    // breakdown the warehouse/shop screens and the POS need. The POS sells shop_qty ONLY.
+    // The two joined subqueries expose only product_id + qty columns, so the unqualified column
+    // names in whereClause above stay unambiguous.
     const { rows } = await pool.query(
-      `SELECT * FROM products ${whereClause} ORDER BY name ASC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      `SELECT products.*,
+         COALESCE(ls.warehouse_qty, 0)::int AS warehouse_qty,
+         COALESCE(ls.shop_qty, 0)::int AS shop_qty,
+         COALESCE(ls.unallocated_qty, 0)::int AS unallocated_qty,
+         COALESCE(tr.in_transit_qty, 0)::int AS in_transit_qty
+       FROM products
+       LEFT JOIN (
+         SELECT product_id,
+                SUM(qty) FILTER (WHERE location = 'warehouse') AS warehouse_qty,
+                SUM(qty) FILTER (WHERE location = 'shop') AS shop_qty,
+                SUM(qty) FILTER (WHERE location = 'unallocated') AS unallocated_qty
+         FROM product_stock GROUP BY product_id
+       ) ls ON ls.product_id = products.id
+       LEFT JOIN (
+         SELECT i.product_id, SUM(i.qty_dispatched - i.qty_received - i.qty_returned) AS in_transit_qty
+         FROM stock_transfer_items i JOIN stock_transfers t ON t.id = i.transfer_id
+         WHERE t.status IN ('In Transit', 'Discrepancy')
+         GROUP BY i.product_id
+       ) tr ON tr.product_id = products.id
+       ${whereClause} ORDER BY name ASC LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
     const { rows: countRows } = await pool.query(`SELECT COUNT(*) FROM products ${whereClause}`, params.slice(0, -2));
@@ -54,9 +77,13 @@ router.get('/', async (req, res, next) => {
 router.get('/movements/all', async (req, res, next) => {
   try {
     const { limit, offset, page, pageSize } = parsePagination(req.query);
-    const { type } = req.query;
-    const typeClause = type ? 'WHERE sm.type = $3' : '';
-    const params = type ? [limit, offset, type] : [limit, offset];
+    const { type, location } = req.query;
+    const params = [limit, offset];
+    const conditions = [];
+    if (type) { params.push(type); conditions.push(`sm.type = $${params.length}`); }
+    // location filter powers the warehouse / shop movement-history views (legacy rows have NULL location)
+    if (location) { params.push(location); conditions.push(`sm.location = $${params.length}`); }
+    const typeClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const { rows } = await pool.query(
       `SELECT sm.*, p.name AS product_name, p.sku AS product_sku, u.name AS user_name
        FROM stock_movements sm
@@ -112,20 +139,25 @@ router.post('/', requireRole('Admin', 'Manager', 'Inventory'), validateBody(prod
            cost_price, sell_price, stock_qty, reorder_level, max_stock, primary_supplier_id, rack, shelf_bin, image)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
         [p.sku, p.partNumber || null, p.barcode || null, p.name, p.category, categoryId, p.brand || null, p.compatibility || null,
-         p.costPrice, p.sellPrice, p.stockQty || 0, p.reorderLevel || 0, p.maxStock || null,
+         p.costPrice, p.sellPrice, 0, p.reorderLevel || 0, p.maxStock || null,
          p.primarySupplierId || null, p.rack || null, p.shelfBin || null, p.image || null]
       );
-      const product = insert.rows[0];
+      let product = insert.rows[0];
 
-      if (product.stock_qty > 0) {
-        await client.query(
-          `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, reference, user_id)
-           VALUES ($1, 'Opening Stock', $2, 0, $2, 'OPEN-NEW', $3)`,
-          [product.id, product.stock_qty, req.user.id]
-        );
+      // Opening stock is recorded at an explicit location (warehouse unless the form says shop).
+      // The product is inserted with 0 and the stock then goes through the same location-aware
+      // path as every other stock change, so products.stock_qty is derived, never written here.
+      const openingQty = Number(p.stockQty) || 0;
+      if (openingQty > 0) {
+        await applyStockChange(client, {
+          productId: product.id, location: p.openingLocation || 'warehouse', delta: openingQty,
+          type: 'Opening Stock', reference: 'OPEN-NEW', userId: req.user.id,
+        });
+        product = (await client.query('SELECT * FROM products WHERE id = $1', [product.id])).rows[0];
       }
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
-        action: `Created product ${product.name}`, module: 'Products & Inventory', after: `Stock: ${product.stock_qty}` }, client);
+        action: `Created product ${product.name}`, module: 'Products & Inventory',
+        after: `Stock: ${product.stock_qty}${openingQty > 0 ? ` (${p.openingLocation || 'warehouse'})` : ''}` }, client);
 
       return product;
     });
@@ -209,10 +241,13 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
 // ---------- Stock adjustment (increase / decrease / damage) — mandatory reason, audited ----------
 router.post('/:id/adjust', requireRole('Admin', 'Manager', 'Inventory'), validateBody(productAdjustSchema), async (req, res, next) => {
   try {
-    const { direction, qty, reason } = req.body;
+    const { direction, qty, reason, location } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason is required for every stock adjustment.' });
     if (!qty || qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero.' });
     if (!['Increase', 'Decrease', 'Damage'].includes(direction)) return res.status(400).json({ error: 'Invalid direction.' });
+    if (location === 'unallocated' && direction === 'Increase') {
+      return res.status(400).json({ error: 'Stock cannot be added to the unallocated bucket. Add it to the warehouse or the shop.' });
+    }
 
     const result = await withTransaction(async (client) => {
       const { rows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [req.params.id]);
@@ -220,22 +255,14 @@ router.post('/:id/adjust', requireRole('Admin', 'Manager', 'Inventory'), validat
       if (!product) throw Object.assign(new Error('Product not found.'), { statusCode: 404 });
 
       const delta = direction === 'Increase' ? qty : -qty;
-      let newQty;
-      try {
-        newQty = applyStockAdjustment(product.stock_qty, delta);
-      } catch (calcErr) {
-        throw Object.assign(calcErr, { statusCode: 400 });
-      }
-
       const type = direction === 'Damage' ? 'Adjustment-Damage' : 'Adjustment';
       const ref = await nextDocumentNumber(client, 'adjustment', { prefix: 'ADJ' });
 
-      await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [newQty, product.id]);
-      await client.query(
-        `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, reason, reference, user_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [product.id, type, delta, product.stock_qty, newQty, reason, ref, req.user.id]
-      );
+      // Adjusts ONLY the chosen location's balance (refuses to go below zero there).
+      const { after: locationQtyAfter } = await applyStockChange(client, {
+        productId: product.id, location, delta, type, reason, reference: ref, userId: req.user.id,
+      });
+      const newQty = product.stock_qty + delta; // company-wide on-hand total after this adjustment
 
       // A "Damage" adjustment permanently removes value from inventory the same way a
       // non-resellable customer return does (see returns.routes.js) — it must write that value
@@ -259,8 +286,8 @@ router.post('/:id/adjust', requireRole('Admin', 'Manager', 'Inventory'), validat
       }
 
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
-        action: `Stock adjustment on ${product.name}: ${delta > 0 ? '+' : ''}${delta} — ${reason}`,
-        module: 'Inventory Control Center', before: `Stock: ${product.stock_qty}`, after: `Stock: ${newQty}` }, client);
+        action: `Stock adjustment on ${product.name} (${location}): ${delta > 0 ? '+' : ''}${delta} — ${reason}`,
+        module: 'Inventory Control Center', before: `Stock: ${product.stock_qty}`, after: `Stock: ${newQty} (${location}: ${locationQtyAfter})` }, client);
 
       return { ...product, stock_qty: newQty };
     });

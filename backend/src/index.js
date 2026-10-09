@@ -26,6 +26,8 @@ const eventsRoutes = require('./routes/events.routes');
 const categoriesRoutes = require('./routes/categories.routes');
 const backupRoutes = require('./routes/backup.routes');
 const resetRoutes = require('./routes/reset.routes');
+const transfersRoutes = require('./routes/transfers.routes');
+const inventoryRoutes = require('./routes/inventory.routes');
 const { startBackupScheduler } = require('./utils/backup');
 
 const app = express();
@@ -88,6 +90,8 @@ app.use('/api/events', eventsRoutes);
 app.use('/api/categories', categoriesRoutes);
 app.use('/api/backups', backupRoutes);
 app.use('/api/production-reset', resetRoutes);
+app.use('/api/transfers', transfersRoutes);
+app.use('/api/inventory', inventoryRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 app.use(errorHandler);

@@ -6,6 +6,7 @@ const { nextDocumentNumber } = require('../utils/documentNumbering');
 const { postJournalEntry } = require('../utils/accounting');
 const { computeStocktakeVariance } = require('../utils/calculations');
 const { broadcast } = require('../utils/events');
+const { getLocationQty, applyStockChange } = require('../utils/stockLocations');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -34,23 +35,34 @@ router.get('/:id', async (req, res, next) => {
 // ---------- Start a stocktake: snapshot current system quantity for every active product ----------
 router.post('/', requireRole('Admin', 'Manager', 'Inventory', 'Warehouse'), async (req, res, next) => {
   try {
+    // A stocktake counts ONE location (the warehouse shelves or the shop floor) — you physically
+    // count one place at a time, and its variances correct that location's balance only.
+    const location = req.body && req.body.location;
+    if (!['warehouse', 'shop'].includes(location)) {
+      return res.status(400).json({ error: 'Choose which location this stocktake counts: "warehouse" or "shop".' });
+    }
     const result = await withTransaction(async (client) => {
       const stocktakeNo = await nextDocumentNumber(client, 'stocktake', { prefix: 'ST' });
       const { rows } = await client.query(
-        `INSERT INTO stocktakes (stocktake_no, status, started_by) VALUES ($1,'In Progress',$2) RETURNING *`,
-        [stocktakeNo, req.user.id]
+        `INSERT INTO stocktakes (stocktake_no, status, started_by, location) VALUES ($1,'In Progress',$2,$3) RETURNING *`,
+        [stocktakeNo, req.user.id, location]
       );
       const stocktake = rows[0];
 
-      const { rows: products } = await client.query('SELECT id, stock_qty FROM products WHERE active = true');
+      const { rows: products } = await client.query(
+        `SELECT p.id, COALESCE(ps.qty, 0) AS qty
+         FROM products p LEFT JOIN product_stock ps ON ps.product_id = p.id AND ps.location = $1
+         WHERE p.active = true`,
+        [location]
+      );
       for (const p of products) {
         await client.query(
           'INSERT INTO stocktake_lines (stocktake_id, product_id, system_qty) VALUES ($1,$2,$3)',
-          [stocktake.id, p.id, p.stock_qty]
+          [stocktake.id, p.id, p.qty]
         );
       }
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
-        action: `Started stocktake ${stocktakeNo} (${products.length} products)`, module: 'Stocktake' }, client);
+        action: `Started stocktake ${stocktakeNo} of the ${location} (${products.length} products)`, module: 'Stocktake' }, client);
 
       return stocktake;
     });
@@ -88,6 +100,9 @@ router.post('/:id/approve', requireRole('Admin', 'Manager'), async (req, res, ne
       const stocktake = stRows[0];
       if (!stocktake) throw httpError(404, 'Stocktake not found.');
       if (stocktake.status !== 'In Progress') throw httpError(409, `Stocktake is already ${stocktake.status}.`);
+      if (!stocktake.location) {
+        throw httpError(409, 'This stocktake was started before warehouse/shop locations existed, so it does not say which location was counted. Cancel it and start a new one for the warehouse or the shop.');
+      }
 
       const { rows: lines } = await client.query(
         'SELECT * FROM stocktake_lines WHERE stocktake_id = $1 AND counted_qty IS NOT NULL', [stocktake.id]
@@ -103,17 +118,19 @@ router.post('/:id/approve', requireRole('Admin', 'Manager'), async (req, res, ne
 
         const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [line.product_id]);
         const product = prodRows[0];
-        const newQty = product.stock_qty + variance; // apply against CURRENT qty in case it moved since the snapshot
+        // Apply the variance against the counted location's CURRENT balance (it may have moved
+        // since the snapshot), never taking that location below zero.
+        const currentQty = await getLocationQty(client, product.id, stocktake.location);
+        const effective = Math.max(currentQty + variance, 0) - currentQty; // clamped delta actually applied
+        if (effective === 0) continue;
 
-        await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [Math.max(newQty, 0), product.id]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, reason, reference, user_id)
-           VALUES ($1, 'Adjustment', $2, $3, $4, $5, $6, $7)`,
-          [product.id, variance, product.stock_qty, Math.max(newQty, 0), line.reason || 'Stocktake variance', stocktake.stocktake_no, req.user.id]
-        );
+        await applyStockChange(client, {
+          productId: product.id, location: stocktake.location, delta: effective, type: 'Adjustment',
+          reason: line.reason || 'Stocktake variance', reference: stocktake.stocktake_no, userId: req.user.id,
+        });
 
-        const value = Math.abs(variance) * Number(product.cost_price);
-        if (variance < 0) totalWriteOffValue += value; else totalWriteOnValue += value;
+        const value = Math.abs(effective) * Number(product.cost_price);
+        if (effective < 0) totalWriteOffValue += value; else totalWriteOnValue += value;
       }
 
       if (totalWriteOffValue > 0) {

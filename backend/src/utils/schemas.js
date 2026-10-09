@@ -24,6 +24,7 @@ const saleSchema = z.object({
     qty: positiveInt,
   })).min(1, 'Cart must contain at least one item.'),
   discountPct: z.coerce.number().min(0).max(100).default(0),
+  discountAmount: z.coerce.number().min(0).default(0), // fixed-amount discount (UGX); used instead of discountPct when > 0
   paymentMethod: z.enum(['Cash', 'Card', 'Mobile Money', 'Credit']),
 });
 
@@ -44,12 +45,16 @@ const productCreateSchema = z.object({
   rack: z.string().trim().optional().nullable(),
   shelfBin: z.string().trim().optional().nullable(),
   image: z.string().optional().nullable(),
+  openingLocation: z.enum(['warehouse', 'shop']).default('warehouse'), // where any opening stock is recorded
 });
 
 const productAdjustSchema = z.object({
   direction: z.enum(['Increase', 'Decrease', 'Damage']),
   qty: positiveInt,
   reason: z.string().trim().min(1, 'A reason is required for every stock adjustment.'),
+  // Which stock is being corrected. Deliberately required (no silent default): with stock split
+  // across locations, "adjust the stock" is ambiguous and a wrong guess would corrupt a balance.
+  location: z.enum(['warehouse', 'shop', 'unallocated'], { required_error: 'Choose which location this adjustment applies to (warehouse or shop).', invalid_type_error: 'Choose which location this adjustment applies to (warehouse or shop).' }),
 });
 
 const poCreateSchema = z.object({
@@ -66,6 +71,7 @@ const poReceiveSchema = z.object({
     poItemId: positiveInt,
     qty: z.coerce.number().int().min(0),
   })).min(1),
+  location: z.enum(['warehouse', 'shop']).default('warehouse'), // where the received goods are put away
 });
 
 const returnSchema = z.object({
@@ -76,6 +82,10 @@ const returnSchema = z.object({
   condition: z.enum(['Resellable', 'Damaged']),
   customerId: positiveInt.optional().nullable(),
   supplierId: positiveInt.optional().nullable(),
+  // Where the returned goods physically are (customer return, resellable: restocked there) or
+  // physically leave from (supplier return). Defaults: shop for customer returns, warehouse for
+  // supplier returns — the places those goods normally are.
+  location: z.enum(['warehouse', 'shop']).optional(),
 }).refine((d) => d.type !== 'Customer' || d.customerId, { message: 'customerId is required for a customer return.', path: ['customerId'] })
   .refine((d) => d.type !== 'Supplier' || d.supplierId, { message: 'supplierId is required for a supplier return.', path: ['supplierId'] });
 

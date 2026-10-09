@@ -8,6 +8,7 @@ const { validateReceiveQty } = require('../utils/calculations');
 const { parsePagination } = require('../utils/pagination');
 const { broadcast } = require('../utils/events');
 const { validateBody, poCreateSchema, poReceiveSchema } = require('../utils/schemas');
+const { applyStockChange } = require('../utils/stockLocations');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -73,7 +74,7 @@ router.post('/', requireRole('Admin', 'Manager', 'Inventory'), validateBody(poCr
 router.post('/:id/receive', requireRole('Admin', 'Manager', 'Inventory'), validateBody(poReceiveSchema), async (req, res, next) => {
   try {
     // lines: [{ poItemId, qty }] — qty is how much is being received right now for that line
-    const { lines } = req.body;
+    const { lines, location: receiveLocation = 'warehouse' } = req.body;
     if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ error: 'Specify at least one line to receive.' });
 
     const result = await withTransaction(async (client) => {
@@ -98,15 +99,15 @@ router.post('/:id/receive', requireRole('Admin', 'Manager', 'Inventory'), valida
 
         const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [poItem.product_id]);
         const product = prodRows[0];
-        const newQty = product.stock_qty + line.qty;
 
         await client.query('UPDATE po_items SET qty_received = qty_received + $1 WHERE id = $2', [line.qty, poItem.id]);
-        await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [newQty, product.id]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, unit_cost, reference, user_id)
-           VALUES ($1, 'Purchase', $2, $3, $4, $5, $6, $7)`,
-          [product.id, line.qty, product.stock_qty, newQty, poItem.unit_cost, po.po_no, req.user.id]
-        );
+        // Supplier goods arrive at the store: received stock lands in the WAREHOUSE (unless the
+        // receiver explicitly says the goods went straight to the shop). It becomes sellable only
+        // once it has been transferred to the shop and the transfer has been received there.
+        await applyStockChange(client, {
+          productId: product.id, location: receiveLocation, delta: line.qty, type: 'Purchase',
+          unitCost: poItem.unit_cost, reference: po.po_no, userId: req.user.id,
+        });
         anyReceived = true;
       }
 

@@ -7,6 +7,7 @@ const { postJournalEntry } = require('../utils/accounting');
 const { parsePagination } = require('../utils/pagination');
 const { broadcast } = require('../utils/events');
 const { validateBody, returnSchema } = require('../utils/schemas');
+const { applyStockChange } = require('../utils/stockLocations');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -31,7 +32,7 @@ router.get('/', async (req, res, next) => {
 
 router.post('/', requireRole('Admin', 'Manager', 'Sales', 'Inventory'), validateBody(returnSchema), async (req, res, next) => {
   try {
-    const { type, productId, qty, reason, condition, customerId, supplierId } = req.body;
+    const { type, productId, qty, reason, condition, customerId, supplierId, location } = req.body;
     if (!['Customer', 'Supplier'].includes(type)) return res.status(400).json({ error: 'Invalid return type.' });
     if (!qty || qty <= 0 || !reason || !reason.trim()) return res.status(400).json({ error: 'Quantity and reason are required.' });
     if (!['Resellable', 'Damaged'].includes(condition)) return res.status(400).json({ error: 'Invalid condition.' });
@@ -51,13 +52,12 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales', 'Inventory'), validate
       if (type === 'Customer') {
         const resellable = condition === 'Resellable';
         if (resellable) {
-          newQty = product.stock_qty + qty;
-          await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [newQty, product.id]);
-          await client.query(
-            `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, reference, user_id)
-             VALUES ($1, 'Return-In', $2, $3, $4, $5, $6)`,
-            [product.id, qty, product.stock_qty, newQty, refNo, req.user.id]
-          );
+          // Resellable goods go back on the shelf where they physically are — the shop by default.
+          const { after } = await applyStockChange(client, {
+            productId: product.id, location: location || 'shop', delta: qty, type: 'Return-In',
+            reference: refNo, userId: req.user.id,
+          });
+          newQty = after;
         } else {
           // Damaged and not resellable: write the cost out of inventory rather than restock it.
           await postJournalEntry(client, {
@@ -83,14 +83,13 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales', 'Inventory'), validate
           ],
         });
       } else {
-        if (product.stock_qty < qty) throw httpError(409, 'Cannot return more units than are currently in stock.');
-        newQty = product.stock_qty - qty;
-        await client.query('UPDATE products SET stock_qty = $1, updated_at = now() WHERE id = $2', [newQty, product.id]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, type, qty_change, balance_before, balance_after, reference, user_id)
-           VALUES ($1, 'Return-Out', $2, $3, $4, $5, $6)`,
-          [product.id, -qty, product.stock_qty, newQty, refNo, req.user.id]
-        );
+        // Goods going back to the supplier leave from the location they are physically held in
+        // (warehouse by default); applyStockChange refuses if that location doesn't hold enough.
+        const { after } = await applyStockChange(client, {
+          productId: product.id, location: location || 'warehouse', delta: -qty, type: 'Return-Out',
+          reference: refNo, userId: req.user.id,
+        });
+        newQty = after;
         const creditAmt = Number(product.cost_price) * qty;
         await client.query('UPDATE suppliers SET balance = GREATEST(0, balance - $1) WHERE id = $2', [creditAmt, supplierId]);
 
@@ -112,9 +111,10 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales', 'Inventory'), validate
         [refNo, type, productId, customerId || null, supplierId || null, qty, reason, condition, req.user.id, creditNoteNo, debitNoteNo]
       );
 
+      const { rows: totalAfter } = await client.query('SELECT stock_qty FROM products WHERE id = $1', [product.id]);
       await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
         action: `Processed ${type.toLowerCase()} return ${refNo}`, module: 'Returns',
-        before: `Stock: ${product.stock_qty}`, after: `Stock: ${newQty}` }, client);
+        before: `Stock: ${product.stock_qty}`, after: `Stock: ${totalAfter[0].stock_qty}` }, client);
 
       return retRows[0];
     });

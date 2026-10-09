@@ -150,3 +150,15 @@ test('round2 — standard currency rounding behaves correctly', () => {
   assert.equal(round2(10.004), 10);
   assert.equal(round2(0.1 + 0.2), 0.3);
 });
+
+test('computeSaleTotals — fixed amount discount applied before tax', () => {
+  const r = computeSaleTotals(100000, 0, 18, 10000);
+  assert.equal(r.discountAmt, 10000);
+  assert.equal(r.taxable, 90000);
+  assert.equal(r.tax, 16200);
+  assert.equal(r.total, 106200);
+});
+
+test('computeSaleTotals — rejects fixed discount larger than subtotal', () => {
+  assert.throws(() => computeSaleTotals(50000, 0, 18, 60000), /more than the sale subtotal/);
+});

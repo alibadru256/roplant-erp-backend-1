@@ -6,12 +6,16 @@
  */
 
 /** Computes sale totals from a subtotal, a discount percentage, and a tax rate percentage. */
-function computeSaleTotals(subtotal, discountPct, taxRatePct) {
+function computeSaleTotals(subtotal, discountPct, taxRatePct, discountAmount = 0) {
   if (subtotal < 0) throw new Error('Subtotal cannot be negative.');
   if (discountPct < 0 || discountPct > 100) throw new Error('Discount percentage must be between 0 and 100.');
+  if (discountAmount < 0) throw new Error('Discount amount cannot be negative.');
+  if (discountAmount > subtotal) throw new Error('Discount amount cannot be more than the sale subtotal.');
   if (taxRatePct < 0) throw new Error('Tax rate cannot be negative.');
 
-  const discountAmt = round2(subtotal * (discountPct / 100));
+  // A discount is either a percentage OR a fixed amount (the sales screen offers one or the
+  // other). If a fixed amount is given it is used as-is; otherwise the percentage applies.
+  const discountAmt = discountAmount > 0 ? round2(discountAmount) : round2(subtotal * (discountPct / 100));
   const taxable = round2(subtotal - discountAmt);
   const tax = round2(taxable * (taxRatePct / 100));
   const total = round2(taxable + tax);

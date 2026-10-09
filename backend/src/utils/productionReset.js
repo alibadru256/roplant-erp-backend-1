@@ -29,7 +29,10 @@ const RESET_TABLES_CHILD_TO_PARENT = [
   'purchase_orders',
   'sale_items',
   'sales',
+  'stock_transfer_items',
+  'stock_transfers',
   'stock_movements',
+  'product_stock',
   'products',
   'categories',
   'customers',
@@ -42,6 +45,7 @@ const RESET_TABLES_CHILD_TO_PARENT = [
 const DOCUMENT_COUNTER_TYPES = [
   'invoice', 'po', 'grn', 'quotation', 'return', 'adjustment',
   'journal', 'credit_note', 'debit_note', 'stocktake', 'customer_code', 'supplier_code',
+  'transfer', 'allocation',
 ];
 
 /**
@@ -68,8 +72,12 @@ async function runProductionReset() {
     for (const table of RESET_TABLES_CHILD_TO_PARENT) {
       // Only tables with an integer PRIMARY KEY / SERIAL sequence need resetting; skip any
       // that don't have one (none currently in this list lack one, but this stays defensive).
+      // (pg_get_serial_sequence errors if the table has no "id" column at all — e.g.
+      // product_stock, whose key is (product_id, location) — so check the column exists first.)
       const { rows } = await client.query(
-        `SELECT pg_get_serial_sequence($1, 'id') AS seq`, [table]
+        `SELECT CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns
+                                  WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'id')
+                     THEN pg_get_serial_sequence($1, 'id') END AS seq`, [table]
       );
       if (rows[0]?.seq) {
         await client.query(`SELECT setval($1, 1, false)`, [rows[0].seq]);
