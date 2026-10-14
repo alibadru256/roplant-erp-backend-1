@@ -1,4 +1,5 @@
 const express = require('express');
+const { productFieldsSql } = require('../utils/productImages');
 const { pool, withTransaction } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
@@ -116,7 +117,7 @@ router.post('/:id/approve', requireRole('Admin', 'Manager'), async (req, res, ne
         const { variance } = computeStocktakeVariance(line.system_qty, line.counted_qty, 0);
         if (variance === 0) continue;
 
-        const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [line.product_id]);
+        const { rows: prodRows } = await client.query(`SELECT ${await productFieldsSql(client)} FROM products WHERE id = $1 FOR UPDATE`, [line.product_id]);
         const product = prodRows[0];
         // Apply the variance against the counted location's CURRENT balance (it may have moved
         // since the snapshot), never taking that location below zero.

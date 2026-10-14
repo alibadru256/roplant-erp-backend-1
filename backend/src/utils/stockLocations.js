@@ -15,6 +15,7 @@
  * last unit at once, or two transfers claiming the same warehouse stock.
  */
 
+const { productFieldsSql } = require('./productImages');
 const LOCATIONS = ['warehouse', 'shop', 'unallocated'];
 const TRANSFER_LOCATIONS = ['warehouse', 'shop'];
 const SELLABLE_LOCATION = 'shop'; // the ONLY location the POS may sell from
@@ -27,8 +28,9 @@ function httpError(statusCode, message) {
  *  multi-item operations) and returns them keyed by id. */
 async function lockProducts(client, productIds) {
   const ids = [...new Set(productIds.map(Number))].sort((a, b) => a - b);
+  const fields = await productFieldsSql(client); // everything except the photo
   const { rows } = await client.query(
-    'SELECT * FROM products WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE', [ids]
+    `SELECT ${fields} FROM products WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE`, [ids]
   );
   return new Map(rows.map((r) => [r.id, r]));
 }

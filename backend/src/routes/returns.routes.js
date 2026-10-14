@@ -1,4 +1,5 @@
 const express = require('express');
+const { productFieldsSql } = require('../utils/productImages');
 const { pool, withTransaction } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
@@ -40,7 +41,7 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales', 'Inventory'), validate
     if (type === 'Supplier' && !supplierId) return res.status(400).json({ error: 'supplierId is required for a supplier return.' });
 
     const result = await withTransaction(async (client) => {
-      const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [productId]);
+      const { rows: prodRows } = await client.query(`SELECT ${await productFieldsSql(client)} FROM products WHERE id = $1 FOR UPDATE`, [productId]);
       const product = prodRows[0];
       if (!product) throw httpError(404, 'Product not found.');
 

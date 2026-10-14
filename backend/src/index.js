@@ -42,9 +42,12 @@ const corsOrigins = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',')
 if (!isProduction && corsOrigins === '*') {
   logger.warn('CORS_ORIGIN is not set — allowing all origins. This is fine for local dev only.');
 }
-app.use(cors({ origin: corsOrigins }));
+// exposedHeaders: the browser app reads the ETag of the product list to ask "has anything changed?" (304).
+app.use(cors({ origin: corsOrigins, exposedHeaders: ['ETag'] }));
 
 app.use(express.json({ limit: '8mb' })); // covers base64 logo/product image uploads (also capped per-field — see settings.routes.js and products.routes.js)
+
+app.use(require('./utils/transferMetrics').requestMiddleware); // per-route attribution for transfer diagnostics
 
 // Lightweight structured request log — every request, one JSON line, no request body
 // (avoids ever accidentally logging a password).
@@ -92,6 +95,7 @@ app.use('/api/backups', backupRoutes);
 app.use('/api/production-reset', resetRoutes);
 app.use('/api/transfers', transfersRoutes);
 app.use('/api/inventory', inventoryRoutes);
+app.use('/api/diagnostics', require('./routes/diagnostics.routes'));
 
 app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 app.use(errorHandler);

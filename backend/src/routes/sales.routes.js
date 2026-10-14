@@ -1,4 +1,5 @@
 const express = require('express');
+const { productFieldsSql } = require('../utils/productImages');
 const { pool, withTransaction } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
@@ -158,7 +159,7 @@ router.post('/', requireRole('Admin', 'Manager', 'Sales'), validateBody(saleSche
     // Runs after the response so a slow or misconfigured mail server never delays checkout.
     if (process.env.OWNER_EMAIL) {
       for (const item of items) {
-        pool.query('SELECT * FROM products WHERE id = $1', [item.productId]).then(({ rows }) => {
+        productFieldsSql(pool).then((fields) => pool.query(`SELECT ${fields} FROM products WHERE id = $1`, [item.productId])).then(({ rows }) => {
           const product = rows[0];
           if (product && product.stock_qty <= product.reorder_level) {
             notifyLowStock(product, process.env.OWNER_EMAIL).catch(() => {});

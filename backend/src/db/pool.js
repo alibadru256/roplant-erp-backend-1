@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const { instrument } = require('../utils/transferMetrics');
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is not set. Copy .env.example to .env and fill it in.');
@@ -8,6 +9,10 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL.includes('sslmode=require') ? { rejectUnauthorized: false } : false,
 });
+
+// Records rows/size per query for the transfer-estimate diagnostics (no DB traffic). Patching each
+// pooled client once, as it is created, covers both pool.query() and withTransaction() without double counting.
+pool.on('connect', (client) => instrument(client));
 
 pool.on('error', (err) => {
   // A background/idle client error should never crash the whole process.

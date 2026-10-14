@@ -8,6 +8,7 @@ const { postJournalEntry } = require('../utils/accounting');
 const { broadcast } = require('../utils/events');
 const { validateBody, productCreateSchema, productAdjustSchema } = require('../utils/schemas');
 const { parsePagination } = require('../utils/pagination');
+const { isInlineImage, imageVersion, getProductColumnsExceptImage, serializeProduct, etagMatches, parseDataUri, md5 } = require('../utils/productImages');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -35,13 +36,44 @@ router.get('/', async (req, res, next) => {
     const limit = Math.min(Number(pageSize) || 50, 200);
     const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
+    // ---- Conditional refresh (ETag / 304) --------------------------------------------------
+    // The validator is computed INSIDE Postgres from the actual data this response is built from
+    // (every non-image product column, per-location balances, and in-transit quantities) and only
+    // a 32-character hash comes back over the network. So it is durable by construction: it is
+    // identical after a server restart or sleep, across several backend instances, and it changes
+    // when ANY writer changes the data — this app, a migration, or someone using the SQL editor.
+    // There is no in-memory version counter to go stale. pg_column_size(image) is the stored size
+    // of the photo (cheap, does not read the photo itself), so a photo change is also noticed.
+    const columns = await getProductColumnsExceptImage(pool);
+    const { rows: vrows } = await pool.query(
+      `SELECT md5(
+         COALESCE((SELECT string_agg(row_to_json(t)::text, '|' ORDER BY t.id)
+                   FROM (SELECT ${columns.join(', ')}, pg_column_size(products.image) AS img_size FROM products) t), '')
+         || '#' || COALESCE((SELECT string_agg(product_id || ':' || location || ':' || qty, ',' ORDER BY product_id, location)
+                             FROM product_stock), '')
+         || '#' || COALESCE((SELECT string_agg(i.id || ':' || (i.qty_dispatched - i.qty_received - i.qty_returned), ',' ORDER BY i.id)
+                             FROM stock_transfer_items i JOIN stock_transfers t ON t.id = i.transfer_id
+                             WHERE t.status IN ('In Transit', 'Discrepancy')), '')
+       ) AS v`
+    );
+    const canonicalQuery = Object.keys(req.query).sort().map((k) => `${k}=${req.query[k]}`).join('&');
+    const etag = `W/"${md5(`${vrows[0].v}|${canonicalQuery}`)}"`;
+    res.set('ETag', etag);
+    res.set('Cache-Control', 'private, no-cache'); // may be stored, but must be revalidated every time
+    if (etagMatches(req.headers['if-none-match'], etag)) return res.status(304).end();
+
     params.push(limit, offset);
     // Same product rows as ever (stock_qty = total on hand across locations), plus the per-location
     // breakdown the warehouse/shop screens and the POS need. The POS sells shop_qty ONLY.
+    // The photo itself is NOT selected: only whether an uploaded photo exists and its version (see
+    // utils/productImages.js). A photo that is a plain URL is small and still returned in `image`.
     // The two joined subqueries expose only product_id + qty columns, so the unqualified column
     // names in whereClause above stay unambiguous.
     const { rows } = await pool.query(
-      `SELECT products.*,
+      `SELECT ${columns.join(', ')},
+         CASE WHEN left(products.image, 5) = 'data:' THEN NULL ELSE products.image END AS image,
+         (left(products.image, 5) = 'data:') AS has_inline_image,
+         floor(extract(epoch FROM products.updated_at) * 1000)::bigint::text AS image_v,
          COALESCE(ls.warehouse_qty, 0)::int AS warehouse_qty,
          COALESCE(ls.shop_qty, 0)::int AS shop_qty,
          COALESCE(ls.unallocated_qty, 0)::int AS unallocated_qty,
@@ -94,6 +126,33 @@ router.get('/movements/all', async (req, res, next) => {
       params
     );
     res.json({ movements: rows, page, pageSize });
+  } catch (err) { next(err); }
+});
+
+// ---------- Product photo (served separately from the list, cached by the browser) ----------
+// Same authentication as every other product route (Authorization header; the frontend fetches it
+// and keeps the result). The URL carries ?v=<image_v>. When v matches the product's current
+// version the response is immutable-cacheable (the URL changes whenever the photo changes); a
+// missing/old v still gets the current photo but must be revalidated (ETag), so a mutable URL is
+// never marked immutable.
+router.get('/:id/image', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT image, updated_at FROM products WHERE id = $1', [req.params.id]);
+    const row = rows[0];
+    if (!row || !row.image) return res.status(404).json({ error: 'No photo for this product.' });
+
+    const current = imageVersion(row.updated_at);
+    const etag = `"${md5(row.image)}"`;
+    res.set('ETag', etag);
+    res.set('Cache-Control', req.query.v === current ? 'private, max-age=31536000, immutable' : 'private, no-cache');
+    if (etagMatches(req.headers['if-none-match'], etag)) return res.status(304).end();
+
+    if (!isInlineImage(row.image)) return res.redirect(302, row.image); // a plain URL: let the browser fetch it directly
+    const parsed = parseDataUri(row.image);
+    if (!parsed) return res.status(415).json({ error: 'Stored photo is not a readable image.' });
+    res.set('Content-Type', parsed.mime);
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.send(parsed.buf);
   } catch (err) { next(err); }
 });
 
@@ -162,7 +221,7 @@ router.post('/', requireRole('Admin', 'Manager', 'Inventory'), validateBody(prod
       return product;
     });
 
-    res.status(201).json({ product: result });
+    res.status(201).json({ product: serializeProduct(result) });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'A product with this SKU or barcode already exists.' });
     next(err);
@@ -186,13 +245,21 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
     if (new Date(p.expectedUpdatedAt).getTime() !== new Date(existing.updated_at).getTime()) {
       return res.status(409).json({
         error: 'This product was changed by someone else since you loaded it. Reload and try again.',
-        current: existing,
+        current: serializeProduct(existing),
       });
     }
 
     if (typeof p.image === 'string' && p.image.startsWith('data:') && p.image.length > 6_000_000) {
       return res.status(413).json({ error: 'Uploaded image is too large. Use an image URL instead, or a smaller file (production should use real object storage, not base64 in the database).' });
     }
+
+    // The list no longer carries uploaded photos, so a client that never loaded one must not be able
+    // to wipe it by sending a blank `image` back. The stored photo changes ONLY when the client says
+    // so explicitly (imageChanged: true — set, replace, paste a URL, or clear), or sends a brand new
+    // uploaded photo (data: URI). Anything else (including an older, cached copy of the frontend
+    // that sends image: '') leaves the stored photo untouched.
+    const imageChanged = p.imageChanged === true || isInlineImage(p.image);
+    const newImage = imageChanged ? (p.image || null) : null;
 
     // Same auto-create as the create route above — see the comment there.
     const { rows: catRows } = await pool.query(
@@ -216,10 +283,10 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
     const { rows } = await pool.query(
       `UPDATE products SET name=$1, category=$2, category_id=$3, brand=$4, compatibility=$5, part_number=$6,
          cost_price=$7, sell_price=$8, reorder_level=$9, max_stock=$10, rack=$11, shelf_bin=$12,
-         image=$13, primary_supplier_id=$14, updated_at=now()
+         image = CASE WHEN $17::boolean THEN $13 ELSE image END, primary_supplier_id=$14, updated_at=now()
        WHERE id=$15 AND date_trunc('milliseconds', updated_at) = date_trunc('milliseconds', $16::timestamptz) RETURNING *`,
       [p.name, p.category, categoryId, p.brand, p.compatibility, p.partNumber, p.costPrice, p.sellPrice,
-       p.reorderLevel, p.maxStock, p.rack, p.shelfBin, p.image, p.primarySupplierId, req.params.id, existing.updated_at]
+       p.reorderLevel, p.maxStock, p.rack, p.shelfBin, newImage, p.primarySupplierId, req.params.id, existing.updated_at, imageChanged]
     );
     // Genuine race: passed the check above but lost the row-level race to another request between
     // the SELECT and this UPDATE — the WHERE guard above catches it. This used to omit `current`,
@@ -227,14 +294,14 @@ router.put('/:id', requireRole('Admin', 'Manager', 'Inventory'), async (req, res
     // to retry with and just failed outright — refetch the row so it can.
     if (!rows[0]) {
       const { rows: freshRows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
-      return res.status(409).json({ error: 'This product was changed by someone else a moment ago. Reload and try again.', current: freshRows[0] });
+      return res.status(409).json({ error: 'This product was changed by someone else a moment ago. Reload and try again.', current: serializeProduct(freshRows[0]) });
     }
 
     await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
       action: `Edited ${rows[0].name}`, module: 'Products & Inventory',
       before: `Sell: ${existing.sell_price}`, after: `Sell: ${rows[0].sell_price}` });
 
-    res.json({ product: rows[0] });
+    res.json({ product: serializeProduct(rows[0]) });
   } catch (err) { next(err); }
 });
 
@@ -322,7 +389,7 @@ router.put('/:id/status', async (req, res, next) => {
     await logAudit({ userId: req.user.id, userName: req.user.name, role: req.user.role,
       action: `${active ? 'Reactivated' : 'Deactivated'} product ${rows[0].name}`, module: 'Products & Inventory' });
 
-    res.json({ product: rows[0] });
+    res.json({ product: serializeProduct(rows[0]) });
   } catch (err) { next(err); }
 });
 

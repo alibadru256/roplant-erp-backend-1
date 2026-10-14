@@ -1,4 +1,5 @@
 const express = require('express');
+const { productFieldsSql } = require('../utils/productImages');
 const QRCode = require('qrcode'); // add to package.json — see note in README
 const { pool } = require('../db/pool');
 const { requireAuth } = require('../middleware/auth');
@@ -39,7 +40,7 @@ router.post('/labels', async (req, res, next) => {
 router.get('/lookup/:code', async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM products WHERE barcode = $1 OR sku = $1', [req.params.code]
+      `SELECT ${await productFieldsSql(pool)} FROM products WHERE barcode = $1 OR sku = $1`, [req.params.code]
     );
     if (!rows[0]) return res.status(404).json({ error: `No product matches code "${req.params.code}".` });
     res.json({ product: rows[0] });

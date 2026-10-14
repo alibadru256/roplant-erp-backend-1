@@ -1,4 +1,5 @@
 const express = require('express');
+const { productFieldsSql } = require('../utils/productImages');
 const { pool, withTransaction } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAudit } = require('../utils/audit');
@@ -97,7 +98,7 @@ router.post('/:id/receive', requireRole('Admin', 'Manager', 'Inventory'), valida
           throw httpError(409, calcErr.message);
         }
 
-        const { rows: prodRows } = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [poItem.product_id]);
+        const { rows: prodRows } = await client.query(`SELECT ${await productFieldsSql(client)} FROM products WHERE id = $1 FOR UPDATE`, [poItem.product_id]);
         const product = prodRows[0];
 
         await client.query('UPDATE po_items SET qty_received = qty_received + $1 WHERE id = $2', [line.qty, poItem.id]);

@@ -41,16 +41,37 @@ const TABLES = [
   { name: 'stocktake_lines', pk: 'id', hasSequence: true },
 ];
 
+// Column list for a table minus its excludeColumns, read once from the real schema. The excluded
+// columns (product photos, company logo) used to be fetched with SELECT * and thrown away in
+// JavaScript — so every backup still pulled all the photos (~4.4 MB for 110 products) out of the
+// database over the network, only to delete them. Selecting just the wanted columns keeps the
+// snapshot byte-for-byte identical but never reads the photos at all.
+const wantedColumnsCache = new Map();
+async function selectListFor(name, excludeColumns) {
+  if (!excludeColumns?.length) return '*';
+  if (!wantedColumnsCache.has(name)) {
+    const { rows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = $1 AND column_name <> ALL($2::text[])
+       ORDER BY ordinal_position`, [name, excludeColumns]
+    );
+    if (!rows.length) return '*'; // never produce an empty column list
+    wantedColumnsCache.set(name, rows.map((r) => `"${r.column_name}"`).join(', '));
+  }
+  return wantedColumnsCache.get(name);
+}
+
 /** Reads every row of every backed-up table into one JSON object, plus a row-count summary. */
 async function captureSnapshot() {
   const data = {};
   const rowCounts = {};
   for (const { name, pk, excludeColumns } of TABLES) {
-    const { rows } = await pool.query(`SELECT * FROM ${name} ORDER BY ${pk}`);
+    const columns = await selectListFor(name, excludeColumns);
+    const { rows } = await pool.query(`SELECT ${columns} FROM ${name} ORDER BY ${pk}`);
     data[name] = excludeColumns?.length
       ? rows.map((row) => {
           const copy = { ...row };
-          for (const col of excludeColumns) delete copy[col];
+          for (const col of excludeColumns) delete copy[col]; // no-op now; kept as a safety net
           return copy;
         })
       : rows;
